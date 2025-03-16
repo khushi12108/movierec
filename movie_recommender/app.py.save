@@ -1,0 +1,180 @@
+^W
+^x
+
+autopep8 --in-place --aggressive --aggressive app.py
+
+from flask import 
+Flask, render_template, request, redirect, 
+url_for
+import requests
+import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import os
+from fuzzywuzzy import process  # For fuzzy matching
+
+app = Flask(__name__)
+
+# TMDb API key (replace with your own or use environment variable)
+API_KEY = os.environ.get('TMDB_API_KEY', 'your_actual_api_key_here')  # Replace 'your_actual_api_key_here'
+BASE_URL = 'https://api.themoviedb.org/3'
+
+# Genre IDs
+genre_ids = {
+    "action": 28,
+    "adventure": 12,
+    "animation": 16,
+    "comedy": 35,
+    "crime": 80,
+    "documentary": 99,
+    "drama": 18,
+    "family": 10751,
+    "fantasy": 14,
+    "history": 36,
+    "horror": 27,
+    "music": 10402,
+    "mystery": 9648,
+    "romance": 10749,
+    "science fiction": 878,
+    "thriller": 53,
+    "war": 10752,
+    "western": 37,
+}
+
+# Load movie data (fetch from multiple pages)
+def load_movie_data():
+    all_movies = []
+    try:
+        for page in range(1, 6):  # Fetch movies from pages 1 to 5
+            url = f"{BASE_URL}/discover/movie"
+            params = {
+                'api_key': API_KEY,
+                'sort_by': 'popularity.desc',
+                'vote_average.gte': 7,
+                'page': page,
+            }
+            response = requests.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+            all_movies.extend(data['results'])
+        df = pd.DataFrame(all_movies)
+        return df
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching movie data: {e}")
+        return pd.DataFrame()
+
+# Fuzzy match movie title
+def fuzzy_match_movie_title(movie_title, df):
+    titles = df['title'].tolist()
+    match, score = process.extractOne(movie_title, titles)
+    return match if score >= 70 else None  # Only return if the match score is >= 70
+
+# Content-based filtering using movie overviews
+def get_content_based_recommendations(movie_title, df, top_n=10):
+    if df.empty:
+        return pd.DataFrame()
+
+    required_columns = ['title', 'overview', 'vote_average', 'poster_path', 'release_date']
+    if not all(col in df.columns for col in required_columns):
+        return pd.DataFrame()
+
+    matched_title = fuzzy_match_movie_title(movie_title, df)
+    if not matched_title:
+        return pd.DataFrame()
+
+    matching_movies = df[df['title'].str.lower() == matched_title.lower()]
+    if matching_movies.empty:
+        return pd.DataFrame()
+
+    tfidf = TfidfVectorizer(stop_words='english')
+    df['overview'] = df['overview'].fillna('')
+    tfidf_matrix = tfidf.fit_transform(df['overview'])
+
+    idx = matching_movies.index[0]
+    cosine_sim = cosine_similarity(tfidf_matrix, tfidf_matrix)
+    sim_scores = sorted(list(enumerate(cosine_sim[idx])), key=lambda x: x[1], reverse=True)[1:top_n + 1]
+
+    movie_indices = [i[0] for i in sim_scores]
+    recommendations = df.iloc[movie_indices]
+    recommendations = recommendations.assign(
+        poster=lambda x: x['poster_path'].apply(lambda y: f"https://image.tmdb.org/t/p/w500{y}" if y else ''),
+        rating=lambda x: x['vote_average']
+    )
+    return recommendations[['title', 'poster', 'overview', 'rating', 'release_date']]
+
+@app.route('/')
+def home():
+    return render_template('index.html')
+
+@app.route('/input', methods=['GET', 'POST'])
+def input_movies():
+    if request.method == 'POST':
+        genre = request.form.get('genre')
+        watched_movies = [movie.strip() for movie in request.form.get('movies', '').split(',') if movie.strip()]
+        release_year = request.form.get('release_year', '')
+
+        if not watched_movies:
+            return render_template('recommendations.html', recommendations=[], message="Please enter at least one movie.")
+
+        # Load movie data
+        df = load_movie_data()
+        print("Initial DataFrame shape:", df.shape)
+        print("DataFrame columns:", df.columns)
+
+        # Filter by genre if provided
+        if genre:
+            genre_id = genre_ids.get(genre.lower())
+            if genre_id:
+                if 'genre_ids' in df.columns:
+                    df = df[df['genre_ids'].apply(lambda x: genre_id in x if isinstance(x, list) else False)]
+                else:
+                    print("Warning: 'genre_ids' column is missing.")
+            print(f"Filtering by genre: {genre}")
+            print("DataFrame shape after genre filtering:", df.shape)
+
+        # Filter by release year if provided
+        if release_year and '-' in release_year:
+            start_year, end_year = map(int, release_year.split('-'))
+            if 'release_date' in df.columns:
+                df['release_year'] = pd.to_numeric(df['release_date'].str[:4], errors='coerce')
+                df = df[(df['release_year'] >= start_year) & (df['release_year'] <= end_year)]
+            else:
+                print("Warning: 'release_date' column is missing.")
+            print(f"Filtering by release year: {release_year}")
+            print("DataFrame shape after release year filtering:", df.shape)
+
+        # Generate recommendations
+        recommendations = pd.DataFrame()
+        for movie_title in watched_movies:
+            print(f"Searching for recommendations for: {movie_title}")
+            movie_recommendations = get_content_based_recommendations(movie_title, df)
+            if not movie_recommendations.empty:
+                print(f"Found recommendations for '{movie_title}': {movie_recommendations.shape[0]} movies")
+                recommendations = pd.concat([recommendations, movie_recommendations])
+            else:
+                print(f"No recommendations found for '{movie_title}'")
+
+        # Remove duplicates and sort recommendations
+        recommendations = recommendations.drop_duplicates(subset=['title'])
+        if not recommendations.empty and 'rating' in recommendations.columns:
+            recommendations = recommendations.sort_values(by='rating', ascending=False)
+            print("Final recommendations:")
+            print(recommendations[['title', 'rating', 'overview', 'release_date']].head())
+        else:
+            print("No recommendations found.")
+
+        # Render the recommendations page
+        if recommendations.empty:
+            return render_template('recommendations.html', recommendations=[], message="No recommendations found. Please try different movies or genres.")
+        return render_template('recommendations.html', recommendations=recommendations.to_dict('records'))
+
+    return render_template('input.html')
+
+
+
+@app.route('/about')
+def about():
+    return render_template('about.html')
+
+if __name__ == '__main__':
+    app.run(debug=True)
